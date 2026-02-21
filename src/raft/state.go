@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"sync/atomic"
 )
 
@@ -24,8 +23,6 @@ const (
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
-	fmt.Printf("server %v crashed\n", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -38,13 +35,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	var term int = rf.currentTerm
-	var isLeader bool = rf.role == Leader
-	if isLeader {
-		fmt.Printf("- GetState: I am leader me %v in term %v time %v\n", rf.me, term, Timestamp())
-		// Your code here (2A).
-	}
-	return term, isLeader
+	return rf.currentTerm, rf.role == Leader
 }
 
 func (rf *Raft) Role() Role {
@@ -65,4 +56,15 @@ func (rf *Raft) raftToLogIndex(raftIndex int) int {
 
 func (rf *Raft) logToRaftIndex(index int) int {
 	return index + rf.lastIncludedIndex
+}
+
+// becomeFollower transitions this server to follower state for newTerm,
+// clearing leader-only state. Must be called with rf.mu held.
+// Does not call persist(); the caller is responsible for that.
+func (rf *Raft) becomeFollower(newTerm int) {
+	rf.role = Follower
+	rf.currentTerm = newTerm
+	rf.votedFor = -1
+	rf.nextIndex = nil
+	rf.matchIndex = nil
 }

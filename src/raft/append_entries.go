@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -33,34 +32,39 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	} else if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = Follower
-		rf.matchIndex = nil
-		rf.nextIndex = nil
+		rf.becomeFollower(args.Term)
 	} else if rf.role == Candidate {
+		// Same term but we're a candidate — a valid leader exists, step down.
 		rf.role = Follower
-		rf.matchIndex = nil
 		rf.nextIndex = nil
+		rf.matchIndex = nil
 	}
 
 	reply.Term = rf.currentTerm
 
 	lastIdx := args.PrevLogIndex + len(args.Entries)
 
+	// Early exit: all entries in this RPC are already covered by our snapshot.
 	if lastIdx < rf.lastIncludedIndex {
-		fmt.Printf("leader's %v prevIdx + log len < follower %v\n", args.LeaderId, rf.me)
 		return
 	}
 
 	rf.lastContact = time.Now()
 
+	// The leader may not know how far ahead our snapshot is. When the RPC's
+	// entry range overlaps with our snapshot, we trim the already-snapshotted
+	// portion so the rest of the handler only sees entries we don't yet have.
+	//
+	// Case 1: the RPC ends exactly at our snapshot boundary.
+	// Treat the final entry as the new prevLog so the conflict check below
+	// verifies agreement at the boundary.
 	if lastIdx == rf.lastIncludedIndex && rf.lastIncludedIndex > 0 {
-		fmt.Printf("leader's %v prevIdx + log len = follower %v\n", args.LeaderId, rf.me)
 		args.PrevLogIndex = lastIdx
 		args.PrevLogTerm = args.Entries[len(args.Entries)-1].Term
 		args.Entries = args.Entries[len(args.Entries)-1:]
 	} else if args.PrevLogIndex < rf.lastIncludedIndex && lastIdx > rf.lastIncludedIndex {
-		fmt.Printf("leader's %v prevIdx + log len > follower %v\n", args.LeaderId, rf.me)
+		// Case 2: the RPC spans across our snapshot boundary.
+		// Skip entries already in the snapshot; start from lastIncludedIndex+1.
 		newPrev := rf.lastIncludedIndex - args.PrevLogIndex - 1
 		args.PrevLogIndex = rf.lastIncludedIndex
 		args.PrevLogTerm = args.Entries[newPrev].Term
@@ -70,13 +74,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// process RPC
 	// AE RPC step 2: check if entry match at prevLogIndex and prevLogTerm
 	if lastRaftIndex := rf.logToRaftIndex(len(rf.log) - 1); args.PrevLogIndex > lastRaftIndex {
-		fmt.Printf("leader (me %v)'s preLogIndex %v out of my (me %v) log len (%v) range time (append log and immediately send hb)%v\n", args.LeaderId, args.PrevLogIndex, rf.me, lastRaftIndex+1, Timestamp())
 		reply.ConflictIndex = lastRaftIndex + 1
 		return
 	} else if args.PrevLogIndex > rf.logToRaftIndex(0) {
 		logIndex := rf.raftToLogIndex(args.PrevLogIndex)
 		if e := rf.log[logIndex]; e.Term != args.PrevLogTerm {
-			fmt.Printf("log conflict: leader %v me %v log index %v leader term %v my term %v time %v \n", args.LeaderId, rf.me, args.PrevLogIndex, e.Term, args.PrevLogTerm, Timestamp())
 			reply.ConflictTerm = e.Term
 			for i, entry := range rf.log {
 				if entry.Term == e.Term {
@@ -108,6 +110,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	newEntries = newEntries[match:]
 
+	// AE RPC step 4: append new entries, deduplicating via the seen map.
+	// seen[cmd] holds the raft index where cmd was previously appended.
+	// If we've already recorded this command at a live log position, update
+	// its term in place rather than creating a duplicate entry.
 	for _, e := range newEntries {
 		if prevIdx, ok := rf.seen[e.Command]; ok && prevIdx > 0 && prevIdx < rf.logToRaftIndex(len(rf.log)) &&
 			rf.log[rf.raftToLogIndex(prevIdx)].Command == e.Command {
@@ -122,15 +128,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	// if args.Entries != nil {
-	// 	fmt.Printf("-------follower check log------\n")
-
-	// 	for i, e := range rf.log {
-	// 		fmt.Printf("me %v, index %v, command %v, term %v, time %v\n", rf.me, rf.logToRaftIndex(i), e.Command, e.Term, Timestamp())
-	// 	}
-	// 	fmt.Printf("-------follower check log------\n")
-	// }
-
 	// AE PRC step 5: check commit index
 	if ci := rf.commitIndex; args.LeaderCommit > ci {
 		ci = args.LeaderCommit
@@ -139,7 +136,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			ci = lastIdx
 		}
 		rf.commitIndex = ci
-		// fmt.Printf("server %v update commit index %v\n", rf.me, rf.commitIndex)
 	}
 	reply.Success = true
 }

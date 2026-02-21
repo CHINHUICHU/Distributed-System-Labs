@@ -2,7 +2,6 @@ package raft
 
 import (
 	"bytes"
-	"fmt"
 
 	"6.5840/labgob"
 )
@@ -52,11 +51,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log = log
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
-		fmt.Printf("server %v recover...., lastIncludedIndex %v\n", rf.me, rf.lastIncludedIndex)
-		fmt.Printf("server %v check log after recovery \n", rf.me)
-		for i, e := range rf.log {
-			fmt.Printf("server %v index %v command %v\n", rf.me, i+rf.lastIncludedIndex, e.Command)
-		}
 		rf.mu.Unlock()
 	}
 }

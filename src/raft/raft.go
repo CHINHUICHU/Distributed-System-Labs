@@ -19,7 +19,6 @@ package raft
 import (
 	//	"bytes"
 
-	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -188,7 +187,6 @@ func (rf *Raft) applier() {
 				Command:      e.Command,
 				CommandIndex: rf.lastApplied,
 			}
-			fmt.Printf("server %v apply msg, command %v index %v term %v time %v\n", rf.me, am.Command, am.CommandIndex, rf.currentTerm, Timestamp())
 			applyEntries = append(applyEntries, am)
 		}
 		rf.mu.Unlock()
@@ -216,7 +214,6 @@ func (rf *Raft) checkCommitIndex() {
 					logIdx := rf.raftToLogIndex(i)
 					valid := logIdx >= 0 && logIdx < len(rf.log)
 					if valid && rf.log[logIdx].Term == rf.currentTerm {
-						// fmt.Printf("- leader (me %v) increase commit index to %v in term %v time %v\n", rf.me, i, rf.currentTerm, Timestamp())
 						rf.commitIndex = i
 					}
 				}

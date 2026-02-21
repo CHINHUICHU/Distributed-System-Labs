@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -18,7 +17,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	fmt.Printf("me %v snapshot: log len %v, commit index %v, last applied %v, old snapshot index %v new snapshot index %v\n", rf.me, len(rf.log), rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, index)
 	idx := rf.raftToLogIndex(index)
 	rf.lastIncludedTerm = rf.log[idx].Term
 	rf.lastIncludedIndex = index
@@ -53,10 +51,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		reply.Term = rf.currentTerm
 		return
 	} else if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = Follower
-		rf.nextIndex = nil
-		rf.matchIndex = nil
+		rf.becomeFollower(args.Term)
 	}
 
 	if args.LastIncludedIndex < rf.lastIncludedIndex || args.LastIncludedIndex <= rf.lastApplied {
@@ -82,12 +77,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
-	fmt.Printf("server %v apply snapshot at index %v, term %v\n", rf.me, applyMsg.SnapshotIndex, applyMsg.SnapshotTerm)
-	fmt.Printf("----- check log after snapshot -----\n")
-	for i, e := range rf.log {
-		fmt.Printf("me %v log index %v command %v\n", rf.me, i+args.LastIncludedIndex, e.Command)
-	}
-	fmt.Printf("----- check log after snapshot -----\n")
 	go func() {
 		rf.applych <- applyMsg
 	}()

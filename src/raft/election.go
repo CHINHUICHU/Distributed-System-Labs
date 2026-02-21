@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -43,12 +42,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		return
 	} else if args.Term > rf.currentTerm {
-		// fmt.Printf("- role changed **Term changed** Got vote request from candidate %v, candidate term %v, me: %v, my term: %v, time: %v\n", args.CandidateId, args.Term, rf.me, rf.currentTerm, Timestamp())
-		rf.role = Follower
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.nextIndex = nil
-		rf.matchIndex = nil
+		rf.becomeFollower(args.Term)
 	}
 
 	// check if candidate's log is more up-to-date
@@ -63,7 +57,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.lastContact = time.Now()
-		fmt.Printf("after voting: %v grant vote to candidate %v in term %v, ***reset election timer***, time %v\n", rf.me, rf.votedFor, rf.currentTerm, Timestamp())
 	}
 	reply.Term = rf.currentTerm
 }
@@ -110,58 +103,46 @@ func (rf *Raft) startElection() {
 	rf.lastContact = time.Now()
 	rf.votedFor = rf.me
 	rf.persist()
-	fmt.Printf("**Term changed** server %v as candidate, increment term %v time %v ***reset election timer*** \n", rf.me, rf.currentTerm, Timestamp())
 	atomic.StoreInt32(&rf.votes, 1)
-	ct := rf.currentTerm
+	electionTerm := rf.currentTerm
 	rf.mu.Unlock()
 	for i := range rf.peers {
 		if rf.Role() == Candidate && i != rf.me {
 			go func(i int) {
+				rf.mu.Lock()
 				lastRaftIdx := -1
 				lastLogTerm := 0
-				rf.mu.Lock()
 				if ll := len(rf.log); ll > 0 {
 					lastRaftIdx = rf.logToRaftIndex(ll - 1)
 					lastLogTerm = rf.log[ll-1].Term
 				}
-				rf.mu.Unlock()
 				args := &RequestVoteArgs{
-					Term:        ct,
+					Term:        electionTerm,
 					CandidateId: rf.me,
 					LastLogIdx:  lastRaftIdx,
 					LastLogTerm: lastLogTerm,
 				}
+				rf.mu.Unlock()
+
 				reply := &RequestVoteReply{}
-				replied := make(chan struct{}, 1)
-				go func(args *RequestVoteArgs, replay *RequestVoteReply, replied chan struct{}) {
-					rf.sendRequestVote(i, args, reply)
-					replied <- struct{}{}
-				}(args, reply, replied)
-			loop:
-				for {
-					select {
-					case <-replied:
-						rf.mu.Lock()
-						isOutdated := rf.currentTerm != args.Term || rf.role != Candidate
-						if !isOutdated {
-							if reply.Term > rf.currentTerm {
-								rf.role = Follower
-								rf.currentTerm = reply.Term
-								rf.matchIndex = nil
-								rf.nextIndex = nil
-								rf.persist()
-							} else if reply.VoteGranted {
-								atomic.AddInt32(&rf.votes, 1)
-							}
-						}
-						rf.mu.Unlock()
-					case <-time.After(RpcTimeout):
-						break loop
-					default:
-						time.Sleep(CheckInterval)
-					}
+				ok := sendRPC(func() { rf.sendRequestVote(i, args, reply) }, RpcTimeout)
+				if !ok {
+					return
 				}
 
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if rf.currentTerm != electionTerm || rf.role != Candidate {
+					return
+				}
+				if reply.Term > rf.currentTerm {
+					rf.becomeFollower(reply.Term)
+					rf.persist()
+					return
+				}
+				if reply.VoteGranted {
+					atomic.AddInt32(&rf.votes, 1)
+				}
 			}(i)
 			time.Sleep(RpcInterval)
 		}
@@ -172,9 +153,8 @@ func (rf *Raft) startElection() {
 	for i := 0; i < 10; i++ {
 		result := int(atomic.LoadInt32(&rf.votes))
 		rf.mu.Lock()
-		if rf.role == Candidate && rf.currentTerm == ct {
+		if rf.role == Candidate && rf.currentTerm == electionTerm {
 			if result > len(rf.peers)/2 {
-				fmt.Printf("- ### ELECTED AS LEADER: %v become leader with vote %v in term %v time %v\n", rf.me, result, ct, Timestamp())
 				rf.role = Leader
 				rf.nextIndex = make([]int, len(rf.peers))
 				for i := range rf.peers {
