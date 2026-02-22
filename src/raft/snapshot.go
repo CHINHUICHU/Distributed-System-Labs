@@ -13,7 +13,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if index >= rf.commitIndex || index < rf.lastIncludedIndex {
+	if index > rf.commitIndex || index < rf.lastIncludedIndex {
 		return
 	}
 
@@ -82,8 +82,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.applych <- applyMsg
 	}()
 	rf.lastIncludedIndex = args.LastIncludedIndex
-	rf.lastApplied = rf.lastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.lastApplied = rf.lastIncludedIndex
+	if rf.commitIndex < rf.lastIncludedIndex {
+		rf.commitIndex = rf.lastIncludedIndex
+	}
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {

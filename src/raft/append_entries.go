@@ -44,27 +44,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	lastIdx := args.PrevLogIndex + len(args.Entries)
 
-	// Early exit: all entries in this RPC are already covered by our snapshot.
-	if lastIdx < rf.lastIncludedIndex {
+	rf.lastContact = time.Now()
+
+	// All entries in this RPC are already covered by our snapshot: accept
+	// trivially so the leader does not backtrack nextIndex, and update
+	// commitIndex from LeaderCommit before returning.
+	if lastIdx <= rf.lastIncludedIndex {
+		if args.LeaderCommit > rf.commitIndex {
+			if last := rf.logToRaftIndex(len(rf.log) - 1); args.LeaderCommit < last {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = last
+			}
+		}
+		reply.Success = true
 		return
 	}
 
-	rf.lastContact = time.Now()
-
-	// The leader may not know how far ahead our snapshot is. When the RPC's
-	// entry range overlaps with our snapshot, we trim the already-snapshotted
-	// portion so the rest of the handler only sees entries we don't yet have.
-	//
-	// Case 1: the RPC ends exactly at our snapshot boundary.
-	// Treat the final entry as the new prevLog so the conflict check below
-	// verifies agreement at the boundary.
-	if lastIdx == rf.lastIncludedIndex && rf.lastIncludedIndex > 0 {
-		args.PrevLogIndex = lastIdx
-		args.PrevLogTerm = args.Entries[len(args.Entries)-1].Term
-		args.Entries = args.Entries[len(args.Entries)-1:]
-	} else if args.PrevLogIndex < rf.lastIncludedIndex && lastIdx > rf.lastIncludedIndex {
-		// Case 2: the RPC spans across our snapshot boundary.
-		// Skip entries already in the snapshot; start from lastIncludedIndex+1.
+	// RPC spans the snapshot boundary: skip the already-snapshotted prefix
+	// and rebase PrevLog onto lastIncludedIndex.
+	if args.PrevLogIndex < rf.lastIncludedIndex {
 		newPrev := rf.lastIncludedIndex - args.PrevLogIndex - 1
 		args.PrevLogIndex = rf.lastIncludedIndex
 		args.PrevLogTerm = args.Entries[newPrev].Term
@@ -110,22 +109,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	newEntries = newEntries[match:]
 
-	// AE RPC step 4: append new entries, deduplicating via the seen map.
-	// seen[cmd] holds the raft index where cmd was previously appended.
-	// If we've already recorded this command at a live log position, update
-	// its term in place rather than creating a duplicate entry.
+	// AE RPC step 4: append new entries.
+	// Followers replicate the log exactly as the leader dictates — no
+	// deduplication here. The seen map is updated so Snapshot() can clean up.
 	for _, e := range newEntries {
-		if prevIdx, ok := rf.seen[e.Command]; ok && prevIdx > 0 && prevIdx < rf.logToRaftIndex(len(rf.log)) &&
-			rf.log[rf.raftToLogIndex(prevIdx)].Command == e.Command {
-			entry := Entry{
-				Term:    reply.Term,
-				Command: e.Command,
-			}
-			rf.log[rf.raftToLogIndex(prevIdx)] = entry
-		} else {
-			rf.log = append(rf.log, e)
-			rf.seen[e.Command] = rf.logToRaftIndex(len(rf.log) - 1)
-		}
+		rf.log = append(rf.log, e)
+		rf.seen[e.Command] = rf.logToRaftIndex(len(rf.log) - 1)
 	}
 
 	// AE PRC step 5: check commit index

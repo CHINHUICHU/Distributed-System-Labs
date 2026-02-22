@@ -132,7 +132,8 @@ func (rf *Raft) appendLogRoutine(peer int, term int) {
 		reply := &AppendEntriesReply{}
 		rf.mu.Unlock()
 
-		if !sendRPC(func() { rf.sendAppendEntries(peer, args, reply) }, RpcTimeout) {
+		var rpcOk bool
+		if !sendRPC(func() { rpcOk = rf.sendAppendEntries(peer, args, reply) }, RpcTimeout) || !rpcOk {
 			time.Sleep(RpcInterval)
 			continue
 		}
@@ -213,8 +214,8 @@ func (rf *Raft) installSnapshotForPeer(peer, term int) {
 		rf.mu.Unlock()
 
 		reply := &InstallSnapshotReply{}
-		ok := sendRPC(func() { rf.sendInstallSnapshot(peer, args, reply) }, RpcTimeout*2)
-		if !ok {
+		var rpcOk bool
+		if !sendRPC(func() { rpcOk = rf.sendInstallSnapshot(peer, args, reply) }, RpcTimeout*2) || !rpcOk {
 			time.Sleep(RpcInterval)
 			continue
 		}

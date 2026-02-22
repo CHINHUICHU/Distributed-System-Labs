@@ -149,6 +149,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.seen[e.Command] = rf.logToRaftIndex(i)
 	}
 
+	// On restart, replay the snapshot so the service can restore its state
+	// before any incremental log entries are applied.
+	if rf.lastIncludedIndex > 0 && len(rf.latestSnapshot) > 0 {
+		snap := ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      rf.latestSnapshot,
+			SnapshotTerm:  rf.lastIncludedTerm,
+			SnapshotIndex: rf.lastIncludedIndex,
+		}
+		go func() { applyCh <- snap }()
+	}
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
@@ -166,12 +178,11 @@ func (rf *Raft) applier() {
 		applyEntries := make([]ApplyMsg, 0)
 		rf.mu.Lock()
 		for rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
-			logIdx := rf.raftToLogIndex(rf.lastApplied)
-			valid := logIdx >= 0 && logIdx < len(rf.log) && rf.log[logIdx].Command != nil
-			if !valid {
+			logIdx := rf.raftToLogIndex(rf.lastApplied + 1)
+			if logIdx < 0 || logIdx >= len(rf.log) || rf.log[logIdx].Command == nil {
 				break
 			}
+			rf.lastApplied++
 			e := rf.log[logIdx]
 			am := ApplyMsg{
 				CommandValid: true,
