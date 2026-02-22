@@ -58,6 +58,13 @@ func (rf *Raft) logToRaftIndex(index int) int {
 	return index + rf.lastIncludedIndex
 }
 
+// isActiveLeader reports whether rf is still the active leader for term.
+// Must be called with rf.mu held.
+func (rf *Raft) isActiveLeader(term int) bool {
+	return !rf.killed() && rf.role == Leader && rf.currentTerm == term &&
+		rf.nextIndex != nil && rf.matchIndex != nil
+}
+
 // becomeFollower transitions this server to follower state for newTerm,
 // clearing leader-only state. Must be called with rf.mu held.
 // Does not call persist(); the caller is responsible for that.

@@ -99,7 +99,7 @@ func (rf *Raft) peerReplicationLoop(peer, term int) {
 func (rf *Raft) appendLogRoutine(peer int, term int) {
 	for {
 		rf.mu.Lock()
-		if rf.role != Leader || rf.nextIndex == nil || rf.matchIndex == nil || rf.killed() || rf.currentTerm != term {
+		if !rf.isActiveLeader(term) {
 			rf.mu.Unlock()
 			return
 		}
@@ -117,9 +117,8 @@ func (rf *Raft) appendLogRoutine(peer int, term int) {
 			return
 		}
 
-		// Build the AppendEntries arguments.
 		prevLogTerm := 0
-		if nextLogIndex-1 >= 0 {
+		if nextLogIndex > 0 {
 			prevLogTerm = rf.log[nextLogIndex-1].Term
 		}
 		args := &AppendEntriesArgs{
@@ -133,14 +132,13 @@ func (rf *Raft) appendLogRoutine(peer int, term int) {
 		reply := &AppendEntriesReply{}
 		rf.mu.Unlock()
 
-		ok := sendRPC(func() { rf.sendAppendEntries(peer, args, reply) }, RpcTimeout)
-		if !ok {
+		if !sendRPC(func() { rf.sendAppendEntries(peer, args, reply) }, RpcTimeout) {
 			time.Sleep(RpcInterval)
 			continue
 		}
 
 		rf.mu.Lock()
-		if rf.role != Leader || rf.nextIndex == nil || rf.matchIndex == nil {
+		if !rf.isActiveLeader(term) {
 			rf.mu.Unlock()
 			return
 		}
@@ -167,24 +165,32 @@ func (rf *Raft) appendLogRoutine(peer int, term int) {
 			return
 		}
 
-		// Follower rejected the entry: fast-back nextIndex using conflict info.
-		newNext := -1
-		for j, e := range rf.log {
-			if e.Term == reply.ConflictTerm {
-				newNext = rf.logToRaftIndex(j) + 1
-			}
-		}
-		if newNext == -1 {
-			newNext = reply.ConflictIndex
-		}
-		if newNext < rf.nextIndex[peer] {
-			rf.nextIndex[peer] = newNext
-		} else {
-			rf.nextIndex[peer]--
-		}
+		// Follower rejected: fast-back nextIndex using conflict info.
+		rf.nextIndex[peer] = rf.fastBacktrackNextIndex(peer, reply.ConflictTerm, reply.ConflictIndex)
 		rf.mu.Unlock()
 		time.Sleep(RpcInterval)
 	}
+}
+
+// fastBacktrackNextIndex returns the new nextIndex[peer] after a rejection.
+// It scans our log for the last entry matching conflictTerm (fast backup
+// optimisation), falling back to conflictIndex if the term is absent.
+// The result never moves nextIndex[peer] forward.
+// Must be called with rf.mu held.
+func (rf *Raft) fastBacktrackNextIndex(peer, conflictTerm, conflictIndex int) int {
+	newNext := -1
+	for j, e := range rf.log {
+		if e.Term == conflictTerm {
+			newNext = rf.logToRaftIndex(j) + 1
+		}
+	}
+	if newNext == -1 {
+		newNext = conflictIndex
+	}
+	if newNext < rf.nextIndex[peer] {
+		return newNext
+	}
+	return rf.nextIndex[peer] - 1
 }
 
 // installSnapshotForPeer sends the current snapshot to peer, retrying on timeout.
@@ -193,7 +199,7 @@ func (rf *Raft) appendLogRoutine(peer int, term int) {
 func (rf *Raft) installSnapshotForPeer(peer, term int) {
 	for {
 		rf.mu.Lock()
-		if rf.role != Leader || rf.nextIndex == nil || rf.matchIndex == nil || rf.killed() || rf.currentTerm != term {
+		if !rf.isActiveLeader(term) {
 			rf.mu.Unlock()
 			return
 		}
