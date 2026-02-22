@@ -68,3 +68,18 @@ func (rf *Raft) becomeFollower(newTerm int) {
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 }
+
+// becomeLeader transitions this server to leader state, initialising
+// nextIndex and matchIndex. Must be called with rf.mu held.
+func (rf *Raft) becomeLeader() {
+	rf.role = Leader
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := range rf.peers {
+		rf.nextIndex[i] = rf.logToRaftIndex(len(rf.log))
+	}
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.peers {
+		rf.matchIndex[i] = -1
+	}
+	rf.matchIndex[rf.me] = rf.logToRaftIndex(len(rf.log) - 1)
+}

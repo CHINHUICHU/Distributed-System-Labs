@@ -1,13 +1,8 @@
 package raft
 
 import (
-	"sync/atomic"
+	"sync"
 	"time"
-)
-
-const (
-	WaitForVotingFinishedBreak = 50 * time.Millisecond
-	DelayToSendHeartbeat       = 75 * time.Millisecond
 )
 
 // example RequestVote RPC arguments structure.
@@ -95,85 +90,73 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-	if rf.role != Candidate || rf.killed() {
+	if rf.role == Leader || rf.killed() {
 		rf.mu.Unlock()
 		return
 	}
+	rf.role = Candidate
 	rf.currentTerm++
 	rf.lastContact = time.Now()
 	rf.votedFor = rf.me
 	rf.persist()
-	atomic.StoreInt32(&rf.votes, 1)
-	electionTerm := rf.currentTerm
+	term := rf.currentTerm
 	rf.mu.Unlock()
-	for i := range rf.peers {
-		if rf.Role() == Candidate && i != rf.me {
-			go func(i int) {
-				rf.mu.Lock()
-				lastRaftIdx := -1
-				lastLogTerm := 0
-				if ll := len(rf.log); ll > 0 {
-					lastRaftIdx = rf.logToRaftIndex(ll - 1)
-					lastLogTerm = rf.log[ll-1].Term
-				}
-				args := &RequestVoteArgs{
-					Term:        electionTerm,
-					CandidateId: rf.me,
-					LastLogIdx:  lastRaftIdx,
-					LastLogTerm: lastLogTerm,
-				}
-				rf.mu.Unlock()
 
-				reply := &RequestVoteReply{}
-				ok := sendRPC(func() { rf.sendRequestVote(i, args, reply) }, RpcTimeout)
-				if !ok {
-					return
-				}
+	var (
+		mu    sync.Mutex
+		votes = 1 // self-vote
+		once  sync.Once
+	)
 
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if rf.currentTerm != electionTerm || rf.role != Candidate {
-					return
-				}
-				if reply.Term > rf.currentTerm {
-					rf.becomeFollower(reply.Term)
-					rf.persist()
-					return
-				}
-				if reply.VoteGranted {
-					atomic.AddInt32(&rf.votes, 1)
-				}
-			}(i)
-			time.Sleep(RpcInterval)
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
 		}
-	}
-
-	time.Sleep(WaitForVotingFinishedBreak)
-	// calculate election result
-	for i := 0; i < 10; i++ {
-		result := int(atomic.LoadInt32(&rf.votes))
-		rf.mu.Lock()
-		if rf.role == Candidate && rf.currentTerm == electionTerm {
-			if result > len(rf.peers)/2 {
-				rf.role = Leader
-				rf.nextIndex = make([]int, len(rf.peers))
-				for i := range rf.peers {
-					rf.nextIndex[i] = rf.logToRaftIndex(len(rf.log)) // last log
-				}
-				rf.matchIndex = make([]int, len(rf.peers))
-				for i := range rf.peers {
-					rf.matchIndex[i] = -1
-				}
-				rf.matchIndex[rf.me] = rf.logToRaftIndex(len(rf.log) - 1)
-				rf.mu.Unlock()
-				time.Sleep(DelayToSendHeartbeat)
-				go rf.reachAgreement()
-				return
+		go func(peer int) {
+			rf.mu.Lock()
+			lastRaftIdx := -1
+			lastLogTerm := 0
+			if ll := len(rf.log); ll > 0 {
+				lastRaftIdx = rf.logToRaftIndex(ll - 1)
+				lastLogTerm = rf.log[ll-1].Term
+			}
+			args := &RequestVoteArgs{
+				Term:        term,
+				CandidateId: rf.me,
+				LastLogIdx:  lastRaftIdx,
+				LastLogTerm: lastLogTerm,
 			}
 			rf.mu.Unlock()
-		} else {
-			rf.mu.Unlock()
-		}
-		time.Sleep(CheckInterval)
+
+			reply := &RequestVoteReply{}
+			if !sendRPC(func() { rf.sendRequestVote(peer, args, reply) }, RpcTimeout) {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.currentTerm != term || rf.role != Candidate {
+				return
+			}
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+				rf.persist()
+				return
+			}
+			if reply.VoteGranted {
+				mu.Lock()
+				votes++
+				won := votes > len(rf.peers)/2
+				mu.Unlock()
+
+				if won {
+					once.Do(func() {
+						rf.becomeLeader()
+						go rf.reachAgreement()
+					})
+				}
+			}
+		}(peer)
 	}
 }

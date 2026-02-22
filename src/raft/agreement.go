@@ -108,7 +108,7 @@ func (rf *Raft) appendLogRoutine(peer int, term int) {
 			LeaderId:     rf.me,
 			PrevLogIndex: rf.nextIndex[peer] - 1,
 			PrevLogTerm:  prevLogTerm,
-			Entries:      rf.log[nextLogIndex:],
+			Entries:      append([]Entry{}, rf.log[nextLogIndex:]...),
 			LeaderCommit: rf.commitIndex,
 		}
 		reply := &AppendEntriesReply{}

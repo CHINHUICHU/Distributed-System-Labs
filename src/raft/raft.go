@@ -71,7 +71,6 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	votes       int32
 
 	log         []Entry
 	commitIndex int
@@ -98,23 +97,15 @@ type Entry struct {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		ms := 50 + rand.Int63()%300
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-		ms = 300 + (rand.Int63() % 200)
-		timeout := time.Duration(ms) * time.Millisecond
-		for {
-			rf.mu.Lock()
-			elapsed := time.Since(rf.lastContact)
-			role := rf.role
-			if elapsed > timeout && role != Leader {
-				rf.role = Candidate
-				rf.mu.Unlock()
-				go rf.startElection()
-				break
-			} else {
-				rf.mu.Unlock()
-			}
-			time.Sleep(CheckInterval)
+		timeout := time.Duration(300+rand.Int63()%200) * time.Millisecond
+		time.Sleep(timeout)
+
+		rf.mu.Lock()
+		timedOut := rf.role != Leader && time.Since(rf.lastContact) >= timeout
+		rf.mu.Unlock()
+
+		if timedOut {
+			go rf.startElection()
 		}
 	}
 }
@@ -190,17 +181,15 @@ func (rf *Raft) applier() {
 			applyEntries = append(applyEntries, am)
 		}
 		rf.mu.Unlock()
-		go func(applyEntries []ApplyMsg) {
-			for _, am := range applyEntries {
-				rf.applych <- am
-			}
-		}(applyEntries)
+		for _, am := range applyEntries {
+			rf.applych <- am
+		}
 		time.Sleep(CheckInterval)
 	}
 }
 
 func (rf *Raft) checkCommitIndex() {
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 		if !rf.killed() && rf.role == Leader && rf.matchIndex != nil && len(rf.log) > 0 {
 			for i := rf.logToRaftIndex(len(rf.log) - 1); i > rf.commitIndex; i-- {

@@ -6,3 +6,5 @@ api.key
 /src/main/mr_*_*
 /src/main/mr-tmp
 out*
+
+.DS_Store

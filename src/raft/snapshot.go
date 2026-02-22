@@ -26,6 +26,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	rf.log = rf.log[idx:]
 	rf.latestSnapshot = snapshot
+	rf.persist()
 }
 
 type InstallSnapshotArgs struct {
