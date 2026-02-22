@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,9 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+
+	persister   *raft.Persister
+	lastApplied int
 
 	store     map[string]string
 	lastSeq   map[int64]int
@@ -125,8 +129,14 @@ func (kv *KVServer) applier() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
 
+		if msg.SnapshotValid {
+			kv.mu.Lock()
+			kv.installSnapshot(msg.Snapshot, msg.SnapshotIndex)
+			kv.mu.Unlock()
+			continue
+		}
+
 		if !msg.CommandValid {
-			// SnapshotValid messages — ignored for Part A
 			continue
 		}
 
@@ -169,7 +179,42 @@ func (kv *KVServer) applier() {
 			delete(kv.notifyCh, index)
 		}
 
+		kv.lastApplied = index
+		if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+			kv.takeSnapshot(index)
+		}
+
 		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) takeSnapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.store)
+	e.Encode(kv.lastSeq)
+	e.Encode(kv.lastReply)
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+func (kv *KVServer) installSnapshot(data []byte, index int) {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var store map[string]string
+	var lastSeq map[int64]int
+	var lastReply map[int64]string
+	if d.Decode(&store) != nil || d.Decode(&lastSeq) != nil || d.Decode(&lastReply) != nil {
+		log.Fatalf("kvserver %d: snapshot decode failed", kv.me)
+	}
+	kv.store = store
+	kv.lastSeq = lastSeq
+	kv.lastReply = lastReply
+	kv.lastApplied = index
+	for idx, ch := range kv.notifyCh {
+		if idx <= index {
+			ch <- notifyMsg{err: ErrWrongLeader}
+			delete(kv.notifyCh, idx)
+		}
 	}
 }
 
@@ -215,6 +260,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastReply = make(map[int64]string)
 	kv.notifyCh = make(map[int]chan notifyMsg)
 
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 

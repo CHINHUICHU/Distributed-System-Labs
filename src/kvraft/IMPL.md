@@ -124,6 +124,143 @@ Runs forever reading `kv.applyCh`:
 
 ---
 
+# Lab 4B Implementation Notes
+
+## Overview
+
+Part B adds snapshotting so the Raft log does not grow without bound.  When
+`persister.RaftStateSize() >= maxraftstate` the KV server encodes its full
+state into a GOB snapshot and hands it to Raft, which discards the corresponding
+log prefix.  On restart (or when a lagging follower receives an InstallSnapshot
+RPC) the snapshot is delivered back to the server via `applyCh` and the
+in-memory state is restored from it.
+
+Only `server.go` was changed.
+
+---
+
+## New struct fields
+
+```go
+persister   *raft.Persister  // to query RaftStateSize()
+lastApplied int              // highest Raft index applied; passed to rf.Snapshot()
+```
+
+`persister` is stored in `StartKVServer` before `raft.Make` is called.
+
+---
+
+## Snapshot encoding format
+
+Three GOB values written in order by `takeSnapshot` and read in the same order
+by `installSnapshot`:
+
+| # | Field | Type |
+|---|-------|------|
+| 1 | `kv.store` | `map[string]string` |
+| 2 | `kv.lastSeq` | `map[int64]int` |
+| 3 | `kv.lastReply` | `map[int64]string` |
+
+All three must be saved so that deduplication works correctly after a restart —
+without `lastSeq`/`lastReply`, a restarted server would re-execute already-applied
+ops that the client retries.
+
+---
+
+## takeSnapshot
+
+```go
+func (kv *KVServer) takeSnapshot(index int) {
+    w := new(bytes.Buffer)
+    e := labgob.NewEncoder(w)
+    e.Encode(kv.store)
+    e.Encode(kv.lastSeq)
+    e.Encode(kv.lastReply)
+    kv.rf.Snapshot(index, w.Bytes())
+}
+```
+
+Called **inline** in the applier while holding `kv.mu`.  `rf.Snapshot` is safe
+to call here because Raft's applier releases `rf.mu` before sending to `applyCh`,
+so there is no lock-cycle.
+
+---
+
+## installSnapshot
+
+```go
+func (kv *KVServer) installSnapshot(data []byte, index int) {
+    // decode store, lastSeq, lastReply ...
+    kv.store     = store
+    kv.lastSeq   = lastSeq
+    kv.lastReply = lastReply
+    kv.lastApplied = index
+    for idx, ch := range kv.notifyCh {
+        if idx <= index {
+            ch <- notifyMsg{err: ErrWrongLeader}
+            delete(kv.notifyCh, idx)
+        }
+    }
+}
+```
+
+Called while holding `kv.mu` for both the startup case and the mid-run
+InstallSnapshot case.
+
+The loop over `notifyCh` handles the race where a handler submitted an op via
+`rf.Start()` and registered a channel, but the log entries it was waiting on are
+now covered by the incoming snapshot and will never arrive as `CommandValid`
+messages.  Sending `ErrWrongLeader` on those channels causes the RPC handler to
+return immediately and the client to retry on a different server.
+
+---
+
+## applier changes
+
+```go
+// SnapshotValid branch (new)
+if msg.SnapshotValid {
+    kv.mu.Lock()
+    kv.installSnapshot(msg.Snapshot, msg.SnapshotIndex)
+    kv.mu.Unlock()
+    continue
+}
+
+// after notifyCh send (new)
+kv.lastApplied = index
+if kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+    kv.takeSnapshot(index)
+}
+```
+
+The snapshot trigger uses `>= maxraftstate` (not a softer fraction) to satisfy
+`TestSnapshotSize3B`, which asserts the log stays under `8 × maxraftstate`.
+
+Startup state restoration requires no special code in `StartKVServer`: Raft
+automatically delivers the persisted snapshot as a `SnapshotValid` ApplyMsg
+before any log entries, so `installSnapshot` handles it uniformly.
+
+---
+
+## Test results (all with `-race`)
+
+```
+TestSnapshotRPC3B                                          PASS   3 s
+TestSnapshotSize3B                                         PASS  13 s
+TestSpeed3B                                                PASS  16 s
+TestSnapshotRecover3B                                      PASS  19 s
+TestSnapshotRecoverManyClients3B                           PASS  20 s
+TestSnapshotUnreliable3B                                   PASS  16 s
+TestSnapshotUnreliableRecover3B                            PASS  20 s
+TestSnapshotUnreliableRecoverConcurrentPartition3B         PASS  28 s
+TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B  PASS  30 s
+                                                   Total  166 s
+```
+
+All 16 Part A tests continue to pass after the Part B changes.
+
+---
+
 ## Raft changes (performance fix)
 
 ### Problem
