@@ -78,9 +78,10 @@ type Raft struct {
 
 	applych chan ApplyMsg
 
-	nextIndex  []int
-	matchIndex []int
-	seen       map[interface{}]int
+	nextIndex    []int
+	matchIndex   []int
+	seen         map[interface{}]int
+	replicateCh  []chan struct{} // one per peer; Start() signals to wake replication loops
 
 	// all the log "before" this index has been snapshoted
 	// the first index of rf.log will be snapshotBefore
@@ -122,15 +123,20 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
+	replicateCh := make([]chan struct{}, len(peers))
+	for i := range replicateCh {
+		replicateCh[i] = make(chan struct{}, 1)
+	}
 	rf := &Raft{
-		peers:       peers,
-		persister:   persister,
-		me:          me,
-		votedFor:    -1,
-		lastContact: time.Now(),
-		applych:     applyCh,
-		log:         make([]Entry, 0),
-		seen:        make(map[interface{}]int),
+		peers:        peers,
+		persister:    persister,
+		me:           me,
+		votedFor:     -1,
+		lastContact:  time.Now(),
+		applych:      applyCh,
+		log:          make([]Entry, 0),
+		seen:         make(map[interface{}]int),
+		replicateCh:  replicateCh,
 	}
 
 	rf.log = append(rf.log, Entry{})

@@ -46,6 +46,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
 		rf.seen[entry.Command] = index
+
+		// Wake all peer replication loops immediately instead of waiting for the heartbeat tick.
+		for i, ch := range rf.replicateCh {
+			if i != rf.me {
+				select {
+				case ch <- struct{}{}:
+				default: // already pending
+				}
+			}
+		}
 	}
 
 	return index, term, isLeader
@@ -87,7 +97,10 @@ func (rf *Raft) peerReplicationLoop(peer, term int) {
 			rf.matchIndex[peer] >= rf.logToRaftIndex(len(rf.log)-1)
 		rf.mu.Unlock()
 		if caughtUp {
-			time.Sleep(AppendInterval)
+			select {
+			case <-rf.replicateCh[peer]:
+			case <-time.After(AppendInterval):
+			}
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +19,19 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Type     string // "Get", "Put", "Append"
+	Key      string
+	Value    string
+	ClientId int64
+	SeqNum   int
+}
+
+type notifyMsg struct {
+	err      Err
+	value    string
+	clientId int64
+	seqNum   int
 }
 
 type KVServer struct {
@@ -34,16 +43,134 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	store     map[string]string
+	lastSeq   map[int64]int
+	lastReply map[int64]string
+	notifyCh  map[int]chan notifyMsg
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	// Fast path: already applied (handles retries of committed ops)
+	if kv.lastSeq[args.ClientId] >= args.SeqNum {
+		reply.Err = OK
+		reply.Value = kv.lastReply[args.ClientId]
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{Type: "Get", Key: args.Key, ClientId: args.ClientId, SeqNum: args.SeqNum}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	ch := make(chan notifyMsg, 1)
+	kv.notifyCh[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-ch:
+		if msg.clientId == args.ClientId && msg.seqNum == args.SeqNum {
+			reply.Err = msg.err
+			reply.Value = msg.value
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+		kv.mu.Lock()
+		delete(kv.notifyCh, index)
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.mu.Lock()
+	// Fast path: already applied (handles retries of committed ops)
+	if kv.lastSeq[args.ClientId] >= args.SeqNum {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{Type: args.Op, Key: args.Key, Value: args.Value, ClientId: args.ClientId, SeqNum: args.SeqNum}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	ch := make(chan notifyMsg, 1)
+	kv.notifyCh[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-ch:
+		if msg.clientId == args.ClientId && msg.seqNum == args.SeqNum {
+			reply.Err = msg.err
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+		kv.mu.Lock()
+		delete(kv.notifyCh, index)
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) applier() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+
+		if !msg.CommandValid {
+			// SnapshotValid messages — ignored for Part A
+			continue
+		}
+
+		op := msg.Command.(Op)
+		index := msg.CommandIndex
+
+		kv.mu.Lock()
+
+		var result notifyMsg
+		result.clientId = op.ClientId
+		result.seqNum = op.SeqNum
+
+		if kv.lastSeq[op.ClientId] >= op.SeqNum {
+			// duplicate: return cached result
+			result.err = OK
+			result.value = kv.lastReply[op.ClientId]
+		} else {
+			switch op.Type {
+			case "Put":
+				kv.store[op.Key] = op.Value
+				result.err = OK
+			case "Append":
+				kv.store[op.Key] += op.Value
+				result.err = OK
+			case "Get":
+				v, ok := kv.store[op.Key]
+				if ok {
+					result.err = OK
+					result.value = v
+				} else {
+					result.err = ErrNoKey
+				}
+			}
+			kv.lastSeq[op.ClientId] = op.SeqNum
+			kv.lastReply[op.ClientId] = result.value
+		}
+
+		if ch, ok := kv.notifyCh[index]; ok {
+			ch <- result
+			delete(kv.notifyCh, index)
+		}
+
+		kv.mu.Unlock()
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -57,7 +184,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -78,20 +204,21 @@ func (kv *KVServer) killed() bool {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
+	kv.store = make(map[string]string)
+	kv.lastSeq = make(map[int64]int)
+	kv.lastReply = make(map[int64]string)
+	kv.notifyCh = make(map[int]chan notifyMsg)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	go kv.applier()
 
 	return kv
 }
