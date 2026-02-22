@@ -53,22 +53,41 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) reachAgreement() {
 	rf.mu.Lock()
-	start := rf.currentTerm
+	term := rf.currentTerm
 	rf.mu.Unlock()
 
+	for peer := range rf.peers {
+		if peer != rf.me {
+			go rf.peerReplicationLoop(peer, term)
+		}
+	}
+}
+
+// peerReplicationLoop drives replication to a single peer for the duration of
+// the current leader term. It calls appendLogRoutine once per AppendInterval,
+// ensuring exactly one goroutine is active per peer at a time.
+// When the peer is already caught up it sleeps AppendInterval (heartbeat rate).
+// When the peer is behind it loops immediately so pending entries are sent
+// without waiting for the next heartbeat tick.
+func (rf *Raft) peerReplicationLoop(peer, term int) {
 	for !rf.killed() {
-		for peer := range rf.peers {
-			rf.mu.Lock()
-			if peer != rf.me && rf.nextIndex != nil && rf.matchIndex != nil && rf.role == Leader && start == rf.currentTerm {
-				rf.mu.Unlock()
-				go rf.appendLogRoutine(peer, start)
-				time.Sleep(RpcInterval)
-			} else if rf.role != Leader || rf.currentTerm != start {
-				rf.mu.Unlock()
-				return
-			} else {
-				rf.mu.Unlock() // peer == rf.me, skip
-			}
+		rf.mu.Lock()
+		if rf.role != Leader || rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+
+		rf.appendLogRoutine(peer, term)
+
+		// Only sleep if the peer is caught up; otherwise loop immediately
+		// to send the next batch of pending entries.
+		rf.mu.Lock()
+		caughtUp := rf.matchIndex != nil && len(rf.log) > 0 &&
+			rf.matchIndex[peer] >= rf.logToRaftIndex(len(rf.log)-1)
+		rf.mu.Unlock()
+		if caughtUp {
+			time.Sleep(AppendInterval)
 		}
 	}
 }
